@@ -1,18 +1,36 @@
-use std::env;
 use std::error::Error;
 use std::fmt::Display;
+use std::fs::{self, File};
+use std::net::SocketAddr;
 #[cfg(target_os = "wasi")]
-use std::os::wasi::io::FromRawFd;
-use std::str::FromStr;
+use std::os::wasi::prelude::OwnedFd;
 
 use anyhow::{bail, Context};
-use futures::{join, select, Stream, StreamExt, TryFutureExt};
+use futures::{join, select, Stream, StreamExt};
+use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::Sender;
 use tokio_stream::wrappers::{BroadcastStream, LinesStream, TcpListenerStream};
 use ulid::Ulid;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind")]
+pub enum Peer {
+    #[serde(rename = "anonymous")]
+    Anonymous,
+    #[serde(rename = "local")]
+    Local { digest: String },
+    #[serde(rename = "keep")]
+    Keep { workload: String, digest: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct AcceptMetadata {
+    pub addr: SocketAddr,
+    pub peer: Peer,
+}
 
 /// Handles the peer TCP stream I/O.
 async fn handle_io(
@@ -46,49 +64,52 @@ async fn handle_io(
 }
 
 /// Handles the peer TCP stream.
-async fn handle(peer: &mut TcpStream, tx: &Sender<String>) {
-    let id = Ulid::new();
-
+async fn handle(stream: &mut TcpStream, peer: Peer, tx: &Sender<String>) -> anyhow::Result<()> {
     let rx = BroadcastStream::new(tx.subscribe());
-    if let Err(e) = tx.send(format!("{id} joined the chat")) {
-        eprintln!("failed to send {id} join event to peers: {e}");
-        return;
-    }
 
-    _ = handle_io(peer, tx, rx, id)
-        .map_err(|e| eprintln!("failed to handle {id} peer I/O: {e}"))
-        .await;
+    let id = match peer {
+        Peer::Anonymous => {
+            bail!("client did not present a valid certificate, refuse connection")
+        }
+        Peer::Local { digest } => bail!("client is running a local workload with digest `{digest}`, abort connection"),
+        Peer::Keep { workload, digest } => match workload.split_once(':') {
+            Some(("store.rvolosatovs.dev/chat/client", "0.1.0" | "0.1.1" | "0.1.2")) => {
+                let id = Ulid::new();
+                tx.send(format!(
+                    "`{id}` joined the chat running `{workload}` with digest `{digest}`"
+                ))
+                .with_context(|| format!("failed to send `{id}` join event to peers"))?;
+                id
+            }
+            Some(("store.rvolosatovs.dev/chat/client", version)) => bail!("client is running unexpected version `{version}` of `rvolosatovs/chat-client`, refuse connection"),
+            _ => bail!("client is running unexpected workload `{workload}`, refuse connection"),
+        },
+    };
 
-    if let Err(e) = tx.send(format!("{id} left the chat")) {
-        eprintln!("failed to send {id} leave event to peers: {e}")
-    }
+    _ = handle_io(stream, tx, rx, id)
+        .await
+        .with_context(|| format!("failed to handle `{id}` peer I/O"))?;
+
+    tx.send(format!("`{id}` left the chat"))
+        .map(|_| ())
+        .with_context(|| format!("failed to send `{id}` leave event to peers"))
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let fd_count = env::var("FD_COUNT").context("failed to lookup `FD_COUNT`")?;
-    let fd_count = usize::from_str(&fd_count).context("failed to parse `FD_COUNT`")?;
-    assert_eq!(
-        fd_count,
-        4, // STDIN, STDOUT, STDERR and a socket
-        "unexpected amount of file descriptors received"
-    );
-    let listener = match env::var("FD_NAMES")
-        .context("failed to lookup `FD_NAMES`")?
-        .splitn(fd_count, ':')
-        .nth(3)
-    {
-        None => bail!("failed to parse `FD_NAMES`"),
-        Some("ingest") => {
-            let l = unsafe { std::net::TcpListener::from_raw_fd(3) };
-            l.set_nonblocking(true)
-                .context("failed to set non-blocking flag on socket")?;
-            TcpListener::from_std(l)
-                .context("failed to initialize Tokio listener")
-                .map(TcpListenerStream::new)?
-        }
-        Some(name) => bail!("unknown socket name `{name}`"),
-    };
+    let listener = File::options()
+        .read(true)
+        .write(true)
+        .open("/net/lis/50000")
+        .map(OwnedFd::from)
+        .map(std::net::TcpListener::from)
+        .context("failed to listen on port 50000")?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to set non-blocking flag on socket")?;
+    let listener = TcpListener::from_std(listener)
+        .context("failed to initialize Tokio listener")
+        .map(TcpListenerStream::new)?;
 
     let (tx, rx) = broadcast::channel(128);
     join!(
@@ -98,10 +119,18 @@ async fn main() -> anyhow::Result<()> {
                 Ok(line) => println!("> {line}"),
             }
         }),
-        listener.for_each_concurrent(None, |peer| async {
-            match peer {
+        listener.for_each_concurrent(None, |stream| async {
+            match stream {
                 Err(e) => eprintln!("failed to accept connection: {e}"),
-                Ok(mut peer) => handle(&mut peer, &tx).await,
+                Ok(mut stream) => {
+                    let md =
+                        fs::read_to_string("/net/peer/lis").expect("failed to query peer metadata");
+                    let AcceptMetadata { addr, peer } =
+                        serde_json::from_str(&md).expect("failed to decode peer metadata");
+                    let _ = handle(&mut stream, peer, &tx).await.map_err(|e| {
+                        eprintln!("failed to handle client connection from `{addr}`: {e}")
+                    });
+                }
             };
         })
     );
